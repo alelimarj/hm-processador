@@ -23,17 +23,13 @@ from openpyxl.worksheet.worksheet import Worksheet
 def detect_base_dir() -> str:
     win_path = r"C:\base_de_dados"
     cloud_path = "./base_de_dados"
-
-    base = win_path if os.name == "nt" else cloud_path
-
-    # evita conflito: só cria se NÃO existir como pasta
-    if not os.path.isdir(base):
-        os.makedirs(base, exist_ok=True)
-
-    return base
+    if os.path.exists(win_path):
+        os.makedirs(win_path, exist_ok=True)
+        return win_path
+    os.makedirs(cloud_path, exist_ok=True)
+    return cloud_path
 
 
-st.set_page_config(...)
 BASE_DIR = detect_base_dir()
 TABELA_XLSX_PATH = os.path.join(BASE_DIR, "TABELA.xlsx")
 CHUNK_SAFE_ROWS = 1_048_000  # margem de segurança (limite Excel 1.048.576)
