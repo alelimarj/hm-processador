@@ -17,17 +17,37 @@ from openpyxl.worksheet.worksheet import Worksheet
 
 
 # =========================
-# 1) CONFIG / PASTA BASE
+# 0) STREAMLIT CONFIG
 # =========================
+st.set_page_config(page_title="HM — Processador Hospitalar",
+                   page_icon="🏥", layout="wide")
 
+
+# =========================
+# 1) CONFIG / PASTA BASE (CLOUD SAFE)
+# =========================
 def detect_base_dir() -> str:
+    """
+    Windows local: C:\\base_de_dados
+    Cloud/Linux: ./base_de_dados (fallback para ./data/base_de_dados se houver conflito)
+
+    Corrige FileExistsError no Cloud quando existe um ARQUIVO com nome "base_de_dados".
+    """
     win_path = r"C:\base_de_dados"
     cloud_path = "./base_de_dados"
-    if os.path.exists(win_path):
-        os.makedirs(win_path, exist_ok=True)
-        return win_path
-    os.makedirs(cloud_path, exist_ok=True)
-    return cloud_path
+
+    # Decide por SO (Cloud é Linux)
+    base = win_path if os.name == "nt" else cloud_path
+
+    # Se existe e NÃO é diretório (ex.: arquivo "base_de_dados"), troca para fallback seguro
+    if os.path.exists(base) and not os.path.isdir(base):
+        base = "./data/base_de_dados"
+
+    # Garante criação segura
+    if not os.path.isdir(base):
+        os.makedirs(base, exist_ok=True)
+
+    return base
 
 
 BASE_DIR = detect_base_dir()
@@ -38,7 +58,6 @@ CHUNK_SAFE_ROWS = 1_048_000  # margem de segurança (limite Excel 1.048.576)
 # =========================
 # 2) CABEÇALHOS FIXOS A..Y
 # =========================
-# A..Y = 25 colunas (homologado por você)
 FIXED_HEADERS_A_TO_Y = [
     "REGISTRO",
     "NOME DO PACIENTE",
@@ -71,7 +90,6 @@ FIXED_HEADERS_A_TO_Y = [
 # =========================
 # 3) LEITURA TXT (ENCODINGS)
 # =========================
-
 def read_txt_as_df(path: str) -> pd.DataFrame:
     encodings = ["utf-8", "utf-8-sig", "latin-1"]
     last_err = None
@@ -88,7 +106,6 @@ def read_txt_as_df(path: str) -> pd.DataFrame:
                 keep_default_na=False,
             )
 
-            # garante 25 colunas (A..Y)
             if df.shape[1] < 25:
                 for _ in range(25 - df.shape[1]):
                     df[df.shape[1]] = ""
@@ -96,7 +113,6 @@ def read_txt_as_df(path: str) -> pd.DataFrame:
             df = df.iloc[:, :25]
             df.columns = FIXED_HEADERS_A_TO_Y
 
-            # tudo string
             for c in df.columns:
                 df[c] = df[c].astype(str)
 
@@ -123,13 +139,12 @@ def format_ddmmaa(dt: datetime) -> str:
 # =========================
 # 4) RENOMEIO AUTOMÁTICO TXT
 # =========================
-
 def rename_txt_by_entrada(path: str) -> str:
     df = read_txt_as_df(path)
     entrada_dt = parse_date_safe(df["ENTRADA"])
 
     if entrada_dt.notna().sum() == 0:
-        return path  # sem data válida: não renomeia
+        return path
 
     mn = entrada_dt.min()
     mx = entrada_dt.max()
@@ -137,11 +152,9 @@ def rename_txt_by_entrada(path: str) -> str:
     new_name = f"{format_ddmmaa(mn)}_a_{format_ddmmaa(mx)}_HM.txt"
     new_path = os.path.join(os.path.dirname(path), new_name)
 
-    # evita conflito: se já é o mesmo
     if os.path.abspath(new_path) == os.path.abspath(path):
         return path
 
-    # evita sobrescrever
     if os.path.exists(new_path):
         base, ext = os.path.splitext(new_name)
         i = 2
@@ -159,7 +172,6 @@ def rename_txt_by_entrada(path: str) -> str:
 # =========================
 # 5) TABELA.xlsx (integração)
 # =========================
-
 def load_tabela_df(path: str) -> pd.DataFrame:
     if not os.path.exists(path):
         return pd.DataFrame()
@@ -176,7 +188,6 @@ def build_tabela_map(tabela_df: pd.DataFrame) -> pd.DataFrame:
     if tabela_df.empty:
         return pd.DataFrame(columns=["KEY_TUSS", "PORTE", "CBHPM", "QTD_AUX_TABELA"])
 
-    # chave: "ID do Procedimento" (tenta achar por nome; senão usa coluna E como fallback)
     cols_lower = {c: str(c).strip().lower() for c in tabela_df.columns}
     key_col = None
     for c, cl in cols_lower.items():
@@ -186,7 +197,7 @@ def build_tabela_map(tabela_df: pd.DataFrame) -> pd.DataFrame:
 
     if key_col is None:
         if len(tabela_df.columns) > 4:
-            key_col = tabela_df.columns[4]  # fallback coluna E
+            key_col = tabela_df.columns[4]
         else:
             return pd.DataFrame(columns=["KEY_TUSS", "PORTE", "CBHPM", "QTD_AUX_TABELA"])
 
@@ -234,7 +245,6 @@ def integrate_tabela(main_df: pd.DataFrame, tabela_map: pd.DataFrame) -> pd.Data
 # =========================
 # 6) COLUNAS ADICIONAIS (após CBHPM)
 # =========================
-
 ADDITIONAL_COLS_ORDER = [
     "CIRURGIÃO",
     "1º AUXILIAR",
@@ -273,7 +283,6 @@ def ensure_additional_columns(df: pd.DataFrame) -> pd.DataFrame:
 # =========================
 # 7) REGRAS DE CÁLCULO (preview em python)
 # =========================
-
 def to_float_safe(x, default=0.0) -> float:
     if x is None:
         return default
@@ -281,7 +290,6 @@ def to_float_safe(x, default=0.0) -> float:
     if s == "" or s.lower() == "nan":
         return default
 
-    # aceita "1.234,56" ou "1234,56" ou "1234.56"
     s2 = s.replace(".", "").replace(",", ".") if ("," in s) else s
     try:
         return float(s2)
@@ -318,7 +326,6 @@ def compute_preview_values(df: pd.DataFrame) -> pd.DataFrame:
 # =========================
 # 8) PROCESSAMENTO ACUMULATIVO + CHUNK EXCEL
 # =========================
-
 def list_txt_files() -> list[str]:
     return sorted(glob.glob(os.path.join(BASE_DIR, "*.txt")))
 
@@ -328,7 +335,6 @@ def process_all_txts() -> pd.DataFrame:
     if not paths:
         return pd.DataFrame(columns=FIXED_HEADERS_A_TO_Y)
 
-    # renomeia antes de concatenar (homologado)
     for p in paths:
         try:
             rename_txt_by_entrada(p)
@@ -374,7 +380,6 @@ def chunk_sheet_name(df_chunk: pd.DataFrame) -> str:
 # =========================
 # 9) EXPORTAÇÃO EXCEL (com fórmulas reais + formatos)
 # =========================
-
 def set_col_format(ws: Worksheet, col_idx: int, number_format: str, start_row: int = 2):
     for r in range(start_row, ws.max_row + 1):
         ws.cell(row=r, column=col_idx).number_format = number_format
@@ -398,11 +403,6 @@ def try_write_numeric(ws: Worksheet, row: int, col: int, value_str):
 
 
 def normalize_numeric_columns_for_excel(ws: Worksheet, cols: list[str]):
-    """
-    Ajuste seguro: garante que campos usados em fórmula sejam numéricos no Excel,
-    e atende QUANTIDADE como VALOR (numérico).
-    """
-    # numéricos gerais
     numeric_cols_general = ["CBHPM", "VIA DE ACESSO",
                             "QUANTIDADE", "QTD_AUX_TABELA", "VALOR DO PROC."]
 
@@ -413,13 +413,10 @@ def normalize_numeric_columns_for_excel(ws: Worksheet, cols: list[str]):
                 raw = ws.cell(row=r, column=idx).value
                 try_write_numeric(ws, r, idx, raw)
 
-            # Formato específico para QUANTIDADE (valores)
             if cname == "QUANTIDADE":
-                # mantém inteiro quando for inteiro, mas aceita decimais também
                 for r in range(2, ws.max_row + 1):
                     ws.cell(row=r, column=idx).number_format = "0.########"
 
-    # códigos formato "0" (homologado)
     for code_col in ["CÓD. TUSS", "CÓD. PRODUTO"]:
         if code_col in cols:
             idx = cols.index(code_col) + 1
@@ -433,7 +430,6 @@ def build_excel_bytes(final_df: pd.DataFrame, tabela_df: pd.DataFrame) -> bytes:
     wb = Workbook()
     wb.remove(wb.active)
 
-    # Aba TABELA (homologado)
     ws_tab = wb.create_sheet("TABELA")
     if tabela_df is not None and not tabela_df.empty:
         ws_tab.append(list(tabela_df.columns))
@@ -456,7 +452,6 @@ def build_excel_bytes(final_df: pd.DataFrame, tabela_df: pd.DataFrame) -> bytes:
 
         ws = wb.create_sheet(sheet_name)
 
-        # header
         ws.append(list(chunk.columns))
         header_font = Font(bold=True)
         for c in range(1, ws.max_column + 1):
@@ -471,7 +466,6 @@ def build_excel_bytes(final_df: pd.DataFrame, tabela_df: pd.DataFrame) -> bytes:
             idx = cols.index(col_name) + 1
             return get_column_letter(idx)
 
-        # dados + fórmulas
         for r_idx, (_, row) in enumerate(chunk.iterrows(), start=2):
             for c_idx, col_name in enumerate(cols, start=1):
                 ws.cell(row=r_idx, column=c_idx).value = row.get(col_name, "")
@@ -508,16 +502,12 @@ def build_excel_bytes(final_df: pd.DataFrame, tabela_df: pd.DataFrame) -> bytes:
                 if reg_col and cir_col and a1_col and a2_col and a3_col and def_col:
                     ws[f"{reg_col}{r_idx}"].value = f"=({cir_col}{r_idx}+{a1_col}{r_idx}+{a2_col}{r_idx}+{a3_col}{r_idx})-{def_col}{r_idx}"
 
-        # garante números (inclui QUANTIDADE como valor)
         normalize_numeric_columns_for_excel(ws, cols)
 
-        # Formatações homologadas:
-        # CBHPM: #.##0,00
         if "CBHPM" in cols:
             cb_idx = cols.index("CBHPM") + 1
             set_col_format(ws, cb_idx, "#.##0,00", start_row=2)
 
-        # largura leve
         for c in range(1, ws.max_column + 1):
             ws.column_dimensions[get_column_letter(c)].width = 18
 
@@ -529,11 +519,7 @@ def build_excel_bytes(final_df: pd.DataFrame, tabela_df: pd.DataFrame) -> bytes:
 # =========================
 # 10) UPLOAD: salvar sem sobrescrever
 # =========================
-
 def safe_save_uploaded_file(uploaded_file, target_dir: str, forced_name: str | None = None) -> str:
-    """
-    Salva evitando sobrescrever. Retorna o caminho final.
-    """
     os.makedirs(target_dir, exist_ok=True)
     original_name = forced_name if forced_name else uploaded_file.name
     base, ext = os.path.splitext(original_name)
@@ -558,11 +544,7 @@ def safe_save_uploaded_file(uploaded_file, target_dir: str, forced_name: str | N
 # =========================
 # 11) LIMPAR BASE (TXT)
 # =========================
-
 def limpar_base_txt() -> int:
-    """
-    Apaga apenas arquivos .txt da pasta base. Retorna quantidade apagada.
-    """
     removed = 0
     for p in glob.glob(os.path.join(BASE_DIR, "*.txt")):
         try:
@@ -576,9 +558,6 @@ def limpar_base_txt() -> int:
 # =========================
 # 12) STREAMLIT UI
 # =========================
-
-st.set_page_config(page_title="HM — Processador Hospitalar",
-                   page_icon="🏥", layout="wide")
 st.title("🏥 HM — Processador Hospitalar TXT → Excel")
 
 with st.expander("📌 Pasta base detectada", expanded=True):
@@ -609,7 +588,7 @@ with col_up1:
 
         if txt_files:
             for f in txt_files:
-                safe_save_uploaded_file(f, BASE_DIR)  # evita sobrescrever
+                safe_save_uploaded_file(f, BASE_DIR)
                 saved_any = True
 
         if tabela_file is not None:
@@ -640,13 +619,11 @@ with col_up2:
 
 st.write("---")
 
-# Botões principais (Recarregar / Exportar único)
 btn_col1, btn_col2 = st.columns([1, 1], gap="large")
 
 recarregar = btn_col1.button(
     "🔄 Recarregar (processar TXT da base)", use_container_width=True)
 
-# Processa sempre que clicar ou se ainda não tiver dados
 if recarregar or "final_df" not in st.session_state:
     try:
         main_df = process_all_txts()
@@ -665,7 +642,6 @@ if recarregar or "final_df" not in st.session_state:
         st.session_state["final_df"] = final_df
         st.session_state["preview_df"] = preview_df
 
-        # invalida cache de excel para forçar novo quando dados mudarem
         st.session_state.pop("excel_bytes", None)
         st.session_state.pop("excel_filename", None)
 
@@ -682,8 +658,6 @@ if preview_df is None or preview_df.empty:
 else:
     st.dataframe(preview_df.head(200), use_container_width=True)
 
-# ===== Exportação em UM ÚNICO BOTÃO (download direto) =====
-# gera bytes uma vez por sessão (ou quando recarregar)
 if final_df is not None and not final_df.empty:
     if "excel_bytes" not in st.session_state:
         try:
@@ -721,7 +695,6 @@ else:
 
 st.write("---")
 
-# ===== Botão Limpar base =====
 st.subheader("🧹 Manutenção da base")
 
 col_l1, col_l2 = st.columns([2, 1], gap="large")
@@ -734,7 +707,6 @@ with col_l1:
 with col_l2:
     if st.button("🧹 Limpar base (apagar TXT)", use_container_width=True, disabled=not confirm_clear):
         removed = limpar_base_txt()
-        # limpa sessão
         for k in ["main_df", "tabela_df", "final_df", "preview_df", "excel_bytes", "excel_filename"]:
             st.session_state.pop(k, None)
         st.success(f"Base limpa: {removed} arquivo(s) .txt removido(s).")
