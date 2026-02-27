@@ -1,30 +1,45 @@
-# HM.py
-# ------------------------------------------------------------
-# HM — Processador automático de TXT (TAB) → Tabela Virtual
-# Pasta monitorada: C:\base_de_dados
-#
-# AJUSTE (novo, homologado agora):
-# - Formatar CÓD. TUSS e CÓD. PRODUTO como valores (numéricos) no Excel exportado
-# - CBHPM com exatamente 2 casas decimais (já em BR) e no Excel number_format "#.##0,00"
-#
-# Mantido todo o processamento homologado anteriormente.
-# ------------------------------------------------------------
+# HM.py — HM – Processador Hospitalar TXT → Excel com Regras e Fórmulas
+# (VERSÃO HOMOLOGADA + upload completo) — BASE HOMOLOGADA + AJUSTES:
+# 1) Unificar "Exportar Excel" + "Baixar Excel" em um único botão (download_button)
+# 2) Botão "Limpar base" (apaga apenas TXT)
+# 3) QUANTIDADE exportada como valor numérico
 
-from __future__ import annotations
-
-from pathlib import Path
+import os
 import io
+import glob
+from datetime import datetime
 import pandas as pd
 import streamlit as st
+from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
+from openpyxl.styles import Alignment, Font
+from openpyxl.worksheet.worksheet import Worksheet
 
 
 # =========================
-# CONFIG
+# 1) CONFIG / PASTA BASE
 # =========================
-PASTA_BASE = r"C:\base_de_dados"
 
-CABECALHOS = [
+def detect_base_dir() -> str:
+    win_path = r"C:\base_de_dados"
+    cloud_path = "./base_de_dados"
+    if os.path.exists(win_path):
+        os.makedirs(win_path, exist_ok=True)
+        return win_path
+    os.makedirs(cloud_path, exist_ok=True)
+    return cloud_path
+
+
+BASE_DIR = detect_base_dir()
+TABELA_XLSX_PATH = os.path.join(BASE_DIR, "TABELA.xlsx")
+CHUNK_SAFE_ROWS = 1_048_000  # margem de segurança (limite Excel 1.048.576)
+
+
+# =========================
+# 2) CABEÇALHOS FIXOS A..Y
+# =========================
+# A..Y = 25 colunas (homologado por você)
+FIXED_HEADERS_A_TO_Y = [
     "REGISTRO",
     "NOME DO PACIENTE",
     "ENTRADA",
@@ -52,732 +67,675 @@ CABECALHOS = [
     "PORTA DE ENTRADA",
 ]
 
-COLS_NUMERICAS = {"REGISTRO", "QUANTIDADE", "VALOR DO PROC."}
-EXCEL_MAX_LINHAS = 1_048_576  # limite por aba
-
 
 # =========================
-# HELPERS
+# 3) LEITURA TXT (ENCODINGS)
 # =========================
-def list_txt_files(folder: str) -> list[Path]:
-    p = Path(folder)
-    if not p.exists():
-        return []
-    return sorted(p.glob("*.txt"), key=lambda x: x.stat().st_mtime, reverse=True)
 
+def read_txt_as_df(path: str) -> pd.DataFrame:
+    encodings = ["utf-8", "utf-8-sig", "latin-1"]
+    last_err = None
 
-def find_tabela_excel(folder: str) -> Path | None:
-    p = Path(folder)
-    for ext in (".xlsx", ".xlsm", ".xls"):
-        candidate = p / f"TABELA{ext}"
-        if candidate.exists():
-            return candidate
-    return None
-
-
-def read_txt_tab(filepath: Path) -> pd.DataFrame:
-    df = None
-    for enc in ("utf-8", "utf-8-sig", "latin-1"):
+    for enc in encodings:
         try:
             df = pd.read_csv(
-                filepath,
+                path,
                 sep="\t",
+                header=None,
                 dtype=str,
                 encoding=enc,
                 engine="python",
-                header=None,
-                on_bad_lines="skip",
+                keep_default_na=False,
             )
-            break
-        except Exception:
-            df = None
 
-    if df is None:
-        raise RuntimeError("Não foi possível ler o TXT (UTF-8/Latin-1).")
+            # garante 25 colunas (A..Y)
+            if df.shape[1] < 25:
+                for _ in range(25 - df.shape[1]):
+                    df[df.shape[1]] = ""
 
-    if df.shape[1] == len(CABECALHOS):
-        df.columns = CABECALHOS
+            df = df.iloc[:, :25]
+            df.columns = FIXED_HEADERS_A_TO_Y
 
-    df = df.fillna("").applymap(lambda x: x.strip() if isinstance(x, str) else x)
-    return df
+            # tudo string
+            for c in df.columns:
+                df[c] = df[c].astype(str)
+
+            return df
+
+        except Exception as e:
+            last_err = e
+            continue
+
+    raise RuntimeError(
+        f"Falha ao ler TXT {os.path.basename(path)}. Último erro: {last_err}")
 
 
-def br_to_float(series: pd.Series) -> pd.Series:
+def parse_date_safe(series: pd.Series) -> pd.Series:
     s = series.astype(str).str.strip()
-    s = s.replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
-    s = s.str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
-    return pd.to_numeric(s, errors="coerce")
-
-
-def aplicar_tipos(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    for col in COLS_NUMERICAS:
-        if col in out.columns:
-            out[col] = br_to_float(out[col])
-
-    if "REGISTRO" in out.columns:
-        out["REGISTRO"] = pd.to_numeric(out["REGISTRO"], errors="coerce").astype("Int64")
-    return out
-
-
-def _money_any_to_float(val) -> float | None:
-    if val is None or (isinstance(val, float) and pd.isna(val)):
-        return None
-    s = str(val).strip()
-    if s == "" or s.lower() in ("nan", "none"):
-        return None
-    s = s.replace(" ", "")
-
-    if "," in s and "." in s:
-        last_comma = s.rfind(",")
-        last_dot = s.rfind(".")
-        if last_comma > last_dot:
-            s = s.replace(".", "").replace(",", ".")
-        else:
-            s = s.replace(",", "")
-    else:
-        if "," in s and "." not in s:
-            s = s.replace(".", "").replace(",", ".")
-    try:
-        return float(s)
-    except Exception:
-        return None
-
-
-def _fmt_br_money(x: float) -> str:
-    return f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-
-
-def _to_float_series_any(s: pd.Series) -> pd.Series:
-    return s.apply(_money_any_to_float).astype("Float64")
-
-
-def formatar_exibicao(df: pd.DataFrame) -> pd.DataFrame:
-    disp = df.copy()
-
-    if "QUANTIDADE" in disp.columns and pd.api.types.is_numeric_dtype(disp["QUANTIDADE"]):
-        disp["QUANTIDADE"] = disp["QUANTIDADE"].apply(
-            lambda x: "" if pd.isna(x) else f"{int(x):,}".replace(",", ".")
-        )
-
-    if "VALOR DO PROC." in disp.columns and pd.api.types.is_numeric_dtype(disp["VALOR DO PROC."]):
-        disp["VALOR DO PROC."] = disp["VALOR DO PROC."].apply(
-            lambda x: "" if pd.isna(x) else _fmt_br_money(float(x))
-        )
-
-    if "CBHPM" in disp.columns:
-        disp["CBHPM"] = disp["CBHPM"].apply(
-            lambda v: "" if _money_any_to_float(v) is None else _fmt_br_money(_money_any_to_float(v))
-        )
-
-    money_cols = [
-        "CIRURGIÃO",
-        "1º AUXILIAR",
-        "2º AUXILIAR",
-        "3º AUXILIAR",
-        "DEFLATOR",
-        "VALOR DE REP. REGRA",
-        "VALOR REP. SISHOP",
-    ]
-    for c in money_cols:
-        if c in disp.columns:
-            disp[c] = disp[c].apply(
-                lambda v: "" if _money_any_to_float(v) is None else _fmt_br_money(_money_any_to_float(v))
-            )
-    return disp
-
-
-def parse_entrada_dates(df: pd.DataFrame) -> pd.Series:
-    if "ENTRADA" not in df.columns:
-        return pd.Series([pd.NaT] * len(df))
-
-    s = df["ENTRADA"].astype(str).str.strip()
-    s = s.replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
-
-    dt = pd.to_datetime(s, dayfirst=True, errors="coerce")
-    if dt.isna().all():
-        m = s.str.extract(r"(?P<data>\b\d{1,2}/\d{1,2}/\d{2,4}\b)")["data"]
-        dt = pd.to_datetime(m, dayfirst=True, errors="coerce")
+    dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
     return dt
 
 
-def safe_filename_component_date(dt: pd.Timestamp) -> str:
-    if pd.isna(dt):
-        return "data_invalida"
+def format_ddmmaa(dt: datetime) -> str:
     return dt.strftime("%d-%m-%y")
 
 
-def build_hm_filename(min_dt: pd.Timestamp, max_dt: pd.Timestamp) -> str:
-    return f"{safe_filename_component_date(min_dt)}_a_{safe_filename_component_date(max_dt)}_HM.txt"
+# =========================
+# 4) RENOMEIO AUTOMÁTICO TXT
+# =========================
+
+def rename_txt_by_entrada(path: str) -> str:
+    df = read_txt_as_df(path)
+    entrada_dt = parse_date_safe(df["ENTRADA"])
+
+    if entrada_dt.notna().sum() == 0:
+        return path  # sem data válida: não renomeia
+
+    mn = entrada_dt.min()
+    mx = entrada_dt.max()
+
+    new_name = f"{format_ddmmaa(mn)}_a_{format_ddmmaa(mx)}_HM.txt"
+    new_path = os.path.join(os.path.dirname(path), new_name)
+
+    # evita conflito: se já é o mesmo
+    if os.path.abspath(new_path) == os.path.abspath(path):
+        return path
+
+    # evita sobrescrever
+    if os.path.exists(new_path):
+        base, ext = os.path.splitext(new_name)
+        i = 2
+        while True:
+            candidate = os.path.join(os.path.dirname(path), f"{base}_{i}{ext}")
+            if not os.path.exists(candidate):
+                new_path = candidate
+                break
+            i += 1
+
+    os.rename(path, new_path)
+    return new_path
 
 
-def ensure_unique_path(target: Path) -> Path:
-    if not target.exists():
-        return target
-    stem = target.stem
-    suffix = target.suffix
-    parent = target.parent
-    i = 1
-    while True:
-        candidate = parent / f"{stem}_{i}{suffix}"
-        if not candidate.exists():
-            return candidate
-        i += 1
+# =========================
+# 5) TABELA.xlsx (integração)
+# =========================
 
+def load_tabela_df(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        return pd.DataFrame()
 
-def maybe_rename_txt_by_entrada(filepath: Path, df: pd.DataFrame) -> tuple[Path, str]:
-    if "ENTRADA" not in df.columns:
-        return filepath, "Sem coluna ENTRADA — não renomeado."
-
-    dt = parse_entrada_dates(df)
-    min_dt = dt.min()
-    max_dt = dt.max()
-
-    if pd.isna(min_dt) or pd.isna(max_dt):
-        return filepath, "ENTRADA inválida/ausente — não renomeado."
-
-    novo_nome = build_hm_filename(min_dt, max_dt)
-
-    if filepath.name == novo_nome:
-        return filepath, "Já está no padrão HM — mantido."
-
-    alvo = ensure_unique_path(filepath.with_name(novo_nome))
     try:
-        novo_path = filepath.rename(alvo)
-        return novo_path, f"Renomeado para: {novo_path.name}"
-    except Exception as e:
-        return filepath, f"Falha ao renomear: {e}"
+        df = pd.read_excel(path, sheet_name="TABELA", dtype=object)
+        return df
+    except ValueError:
+        raise RuntimeError(
+            "O arquivo TABELA.xlsx foi encontrado, mas NÃO possui a aba 'TABELA'.")
 
 
-def compute_minmax_for_sheet(df: pd.DataFrame) -> tuple[pd.Timestamp, pd.Timestamp]:
-    dt = parse_entrada_dates(df)
-    return dt.min(), dt.max()
+def build_tabela_map(tabela_df: pd.DataFrame) -> pd.DataFrame:
+    if tabela_df.empty:
+        return pd.DataFrame(columns=["KEY_TUSS", "PORTE", "CBHPM", "QTD_AUX_TABELA"])
+
+    # chave: "ID do Procedimento" (tenta achar por nome; senão usa coluna E como fallback)
+    cols_lower = {c: str(c).strip().lower() for c in tabela_df.columns}
+    key_col = None
+    for c, cl in cols_lower.items():
+        if "id" in cl and "proced" in cl:
+            key_col = c
+            break
+
+    if key_col is None:
+        if len(tabela_df.columns) > 4:
+            key_col = tabela_df.columns[4]  # fallback coluna E
+        else:
+            return pd.DataFrame(columns=["KEY_TUSS", "PORTE", "CBHPM", "QTD_AUX_TABELA"])
+
+    def safe_iloc(idx: int):
+        return tabela_df.columns[idx] if len(tabela_df.columns) > idx else None
+
+    porte_col = safe_iloc(8)
+    qtd_aux_col = safe_iloc(10)
+    cbhpm_col = safe_iloc(15)
+
+    out = pd.DataFrame()
+    out["KEY_TUSS"] = tabela_df[key_col].astype(str).str.strip()
+    out["PORTE"] = tabela_df[porte_col] if porte_col is not None else None
+    out["CBHPM"] = tabela_df[cbhpm_col] if cbhpm_col is not None else None
+    out["QTD_AUX_TABELA"] = tabela_df[qtd_aux_col] if qtd_aux_col is not None else None
+    return out
 
 
-def sheet_name_from_minmax(min_dt: pd.Timestamp, max_dt: pd.Timestamp) -> str:
-    return f"{safe_filename_component_date(min_dt)}_a_{safe_filename_component_date(max_dt)}"
+def integrate_tabela(main_df: pd.DataFrame, tabela_map: pd.DataFrame) -> pd.DataFrame:
+    if main_df.empty:
+        return main_df
+
+    if tabela_map.empty:
+        for col in ["PORTE", "CBHPM", "QTD_AUX_TABELA"]:
+            if col not in main_df.columns:
+                main_df[col] = ""
+        return main_df
+
+    tmp = tabela_map.copy()
+    tmp["KEY_TUSS"] = tmp["KEY_TUSS"].astype(str).str.strip()
+
+    df = main_df.copy()
+    df["CÓD. TUSS"] = df["CÓD. TUSS"].astype(str).str.strip()
+
+    df = df.merge(
+        tmp[["KEY_TUSS", "PORTE", "CBHPM", "QTD_AUX_TABELA"]],
+        how="left",
+        left_on="CÓD. TUSS",
+        right_on="KEY_TUSS",
+    ).drop(columns=["KEY_TUSS"])
+
+    return df
 
 
-def chunk_df_for_excel_by_max_rows(df: pd.DataFrame, max_rows: int = EXCEL_MAX_LINHAS) -> list[tuple[str, pd.DataFrame]]:
+# =========================
+# 6) COLUNAS ADICIONAIS (após CBHPM)
+# =========================
+
+ADDITIONAL_COLS_ORDER = [
+    "CIRURGIÃO",
+    "1º AUXILIAR",
+    "2º AUXILIAR",
+    "3º AUXILIAR",
+    "DEFLATOR",
+    "VALOR DE REP. REGRA",
+    "VALOR REP. SISHOP",
+    "COMPLEMENTE",
+    "DEDUÇÃO",
+    "PROFISSIONAL",
+]
+
+
+def ensure_additional_columns(df: pd.DataFrame) -> pd.DataFrame:
+    for col in ["PORTE", "CBHPM", "QTD_AUX_TABELA"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    out = df.copy()
+
+    for col in ADDITIONAL_COLS_ORDER:
+        if col not in out.columns:
+            out[col] = ""
+
+    cols = list(out.columns)
+    if "CBHPM" in cols:
+        idx = cols.index("CBHPM")
+        left = cols[: idx + 1]
+        right = [c for c in cols[idx + 1:] if c not in ADDITIONAL_COLS_ORDER]
+        out = out[left + ADDITIONAL_COLS_ORDER + right]
+
+    return out
+
+
+# =========================
+# 7) REGRAS DE CÁLCULO (preview em python)
+# =========================
+
+def to_float_safe(x, default=0.0) -> float:
+    if x is None:
+        return default
+    s = str(x).strip()
+    if s == "" or s.lower() == "nan":
+        return default
+
+    # aceita "1.234,56" ou "1234,56" ou "1234.56"
+    s2 = s.replace(".", "").replace(",", ".") if ("," in s) else s
+    try:
+        return float(s2)
+    except:
+        return default
+
+
+def compute_preview_values(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
+    cbhpm = out["CBHPM"].apply(to_float_safe)
+    via = out["VIA DE ACESSO"].apply(lambda v: to_float_safe(v, default=1.0))
+    qtd = out["QUANTIDADE"].apply(lambda v: to_float_safe(v, default=0.0))
+    qtd_aux = out["QTD_AUX_TABELA"].apply(
+        lambda v: int(to_float_safe(v, default=0.0)))
+
+    cir = cbhpm * via * qtd
+    aux1 = cir * 0.3 * (qtd_aux >= 1)
+    aux2 = cir * 0.2 * (qtd_aux >= 2)
+    aux3 = aux1 * 0.1 * (qtd_aux >= 3)
+    deflator = (aux1 + aux2 + aux3) * 0.2
+    regra = (cir + aux1 + aux2 + aux3) - deflator
+
+    out["CIRURGIÃO"] = cir
+    out["1º AUXILIAR"] = aux1
+    out["2º AUXILIAR"] = aux2
+    out["3º AUXILIAR"] = aux3
+    out["DEFLATOR"] = deflator
+    out["VALOR DE REP. REGRA"] = regra
+
+    return out
+
+
+# =========================
+# 8) PROCESSAMENTO ACUMULATIVO + CHUNK EXCEL
+# =========================
+
+def list_txt_files() -> list[str]:
+    return sorted(glob.glob(os.path.join(BASE_DIR, "*.txt")))
+
+
+def process_all_txts() -> pd.DataFrame:
+    paths = list_txt_files()
+    if not paths:
+        return pd.DataFrame(columns=FIXED_HEADERS_A_TO_Y)
+
+    # renomeia antes de concatenar (homologado)
+    for p in paths:
+        try:
+            rename_txt_by_entrada(p)
+        except:
+            pass
+
+    paths = list_txt_files()
+
+    dfs = []
+    for p in paths:
+        dfs.append(read_txt_as_df(p))
+
+    main = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame(
+        columns=FIXED_HEADERS_A_TO_Y)
+    return main
+
+
+def chunk_dataframe_for_excel(df: pd.DataFrame) -> list[pd.DataFrame]:
     if df.empty:
-        return []
-    chunks: list[tuple[str, pd.DataFrame]] = []
-    total = len(df)
+        return [df]
+
+    chunks = []
+    n = len(df)
     start = 0
-    while start < total:
-        end = min(start + max_rows, total)
-        chunk = df.iloc[start:end].copy()
-        mn, mx = compute_minmax_for_sheet(chunk)
-        sname = sheet_name_from_minmax(mn, mx)
-        chunks.append((sname, chunk))
+    while start < n:
+        end = min(start + CHUNK_SAFE_ROWS, n)
+        chunks.append(df.iloc[start:end].copy())
         start = end
     return chunks
 
 
-def _norm_key_series(s: pd.Series) -> pd.Series:
-    out = s.astype(str).str.strip()
-    out = out.replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
-    out = out.str.replace(r"\.0$", "", regex=True)
-    return out
+def chunk_sheet_name(df_chunk: pd.DataFrame) -> str:
+    if df_chunk.empty:
+        return "SEM_DADOS"
+    entrada_dt = parse_date_safe(df_chunk["ENTRADA"])
+    if entrada_dt.notna().sum() == 0:
+        return "SEM_DATA"
+    mn = entrada_dt.min()
+    mx = entrada_dt.max()
+    return f"{format_ddmmaa(mn)}_a_{format_ddmmaa(mx)}"
 
 
-def load_tabela_mapping(excel_path: Path) -> tuple[pd.DataFrame, str]:
-    try:
-        df_tab = pd.read_excel(excel_path, sheet_name="TABELA", dtype=object)
-    except Exception as e:
-        return pd.DataFrame(), f"Falha ao ler Excel/aba 'TABELA': {e}"
+# =========================
+# 9) EXPORTAÇÃO EXCEL (com fórmulas reais + formatos)
+# =========================
 
-    if df_tab.empty:
-        return pd.DataFrame(), "Aba 'TABELA' está vazia."
-
-    cols_lower = {str(c).strip().lower(): c for c in df_tab.columns}
-    key_col = None
-    for candidate in ("id do procedimento", "id procedimento", "id_procedimento", "procedimento id"):
-        if candidate in cols_lower:
-            key_col = cols_lower[candidate]
-            break
-    if key_col is None:
-        key_col = df_tab.columns[0]
-
-    if df_tab.shape[1] < 16:
-        return pd.DataFrame(), (
-            f"Aba 'TABELA' tem {df_tab.shape[1]} colunas — preciso de pelo menos 16 "
-            "(para pegar colunas i, K e p)."
-        )
-
-    col_i = df_tab.columns[8]    # i
-    col_k = df_tab.columns[10]   # K
-    col_p = df_tab.columns[15]   # p
-
-    mapping = df_tab[[key_col, col_i, col_k, col_p]].copy()
-    mapping.columns = ["ID do Procedimento", "PORTE", "QTD_AUX_TABELA", "CBHPM"]
-
-    mapping["ID do Procedimento"] = _norm_key_series(mapping["ID do Procedimento"])
-    mapping["PORTE"] = mapping["PORTE"].astype(str).str.strip().replace({"nan": "", "None": ""})
-    mapping["CBHPM"] = mapping["CBHPM"].astype(str).str.strip().replace({"nan": "", "None": ""})
-    mapping["QTD_AUX_TABELA"] = pd.to_numeric(mapping["QTD_AUX_TABELA"], errors="coerce").fillna(0).astype("Int64")
-
-    mapping = mapping.dropna(subset=["ID do Procedimento"])
-    mapping = mapping[mapping["ID do Procedimento"].astype(str).str.len() > 0]
-    mapping = mapping.drop_duplicates(subset=["ID do Procedimento"], keep="last")
-
-    return mapping, f"OK: mapeamento carregado ({len(mapping):,} chaves)".replace(",", ".")
+def set_col_format(ws: Worksheet, col_idx: int, number_format: str, start_row: int = 2):
+    for r in range(start_row, ws.max_row + 1):
+        ws.cell(row=r, column=col_idx).number_format = number_format
 
 
-def load_tabela_sheet_df(excel_path: Path) -> pd.DataFrame:
-    return pd.read_excel(excel_path, sheet_name="TABELA", dtype=object)
+def try_write_numeric(ws: Worksheet, row: int, col: int, value_str):
+    s = str(value_str).strip()
+    if s == "" or s.lower() == "nan":
+        ws.cell(row=row, column=col).value = None
+        return
+
+    if s.isdigit():
+        ws.cell(row=row, column=col).value = int(s)
+        return
+
+    v = to_float_safe(s, default=None)
+    if v is None:
+        ws.cell(row=row, column=col).value = s
+    else:
+        ws.cell(row=row, column=col).value = v
 
 
-def enrich_with_tabela(df_final: pd.DataFrame, mapping: pd.DataFrame) -> pd.DataFrame:
-    out = df_final.copy()
+def normalize_numeric_columns_for_excel(ws: Worksheet, cols: list[str]):
+    """
+    Ajuste seguro: garante que campos usados em fórmula sejam numéricos no Excel,
+    e atende QUANTIDADE como VALOR (numérico).
+    """
+    # numéricos gerais
+    numeric_cols_general = ["CBHPM", "VIA DE ACESSO",
+                            "QUANTIDADE", "QTD_AUX_TABELA", "VALOR DO PROC."]
 
-    if "PORTE" not in out.columns:
-        out["PORTE"] = ""
-    if "CBHPM" not in out.columns:
-        out["CBHPM"] = ""
-    if "QTD_AUX_TABELA" not in out.columns:
-        out["QTD_AUX_TABELA"] = pd.Series([0] * len(out), dtype="Int64")
+    for cname in numeric_cols_general:
+        if cname in cols:
+            idx = cols.index(cname) + 1
+            for r in range(2, ws.max_row + 1):
+                raw = ws.cell(row=r, column=idx).value
+                try_write_numeric(ws, r, idx, raw)
 
-    if out.empty or mapping.empty:
-        return out
-    if "CÓD. TUSS" not in out.columns:
-        return out
+            # Formato específico para QUANTIDADE (valores)
+            if cname == "QUANTIDADE":
+                # mantém inteiro quando for inteiro, mas aceita decimais também
+                for r in range(2, ws.max_row + 1):
+                    ws.cell(row=r, column=idx).number_format = "0.########"
 
-    out["_KEY_TUSS"] = _norm_key_series(out["CÓD. TUSS"])
-    map2 = mapping.rename(columns={"ID do Procedimento": "_KEY_TUSS"}).copy()
-
-    out = out.merge(
-        map2[["_KEY_TUSS", "PORTE", "QTD_AUX_TABELA", "CBHPM"]],
-        on="_KEY_TUSS",
-        how="left",
-        suffixes=("", "_m"),
-    )
-
-    if "PORTE_m" in out.columns:
-        out["PORTE"] = out["PORTE"].astype(str).str.strip()
-        out["PORTE_m"] = out["PORTE_m"].fillna("").astype(str).str.strip()
-        out["PORTE"] = out["PORTE"].where(out["PORTE"] != "", out["PORTE_m"])
-        out.drop(columns=["PORTE_m"], inplace=True, errors="ignore")
-
-    if "CBHPM_m" in out.columns:
-        out["CBHPM"] = out["CBHPM"].astype(str).str.strip()
-        out["CBHPM_m"] = out["CBHPM_m"].fillna("").astype(str).str.strip()
-        out["CBHPM"] = out["CBHPM"].where(out["CBHPM"] != "", out["CBHPM_m"])
-        out.drop(columns=["CBHPM_m"], inplace=True, errors="ignore")
-
-    if "QTD_AUX_TABELA_m" in out.columns:
-        out["QTD_AUX_TABELA_m"] = pd.to_numeric(out["QTD_AUX_TABELA_m"], errors="coerce")
-        out["QTD_AUX_TABELA"] = pd.to_numeric(out["QTD_AUX_TABELA"], errors="coerce")
-        out["QTD_AUX_TABELA"] = out["QTD_AUX_TABELA"].where(out["QTD_AUX_TABELA"].notna(), out["QTD_AUX_TABELA_m"])
-        out["QTD_AUX_TABELA"] = out["QTD_AUX_TABELA"].fillna(out["QTD_AUX_TABELA_m"])
-        out.drop(columns=["QTD_AUX_TABELA_m"], inplace=True, errors="ignore")
-
-    out["PORTE"] = out["PORTE"].fillna("")
-    out["CBHPM"] = out["CBHPM"].fillna("")
-    out["QTD_AUX_TABELA"] = pd.to_numeric(out["QTD_AUX_TABELA"], errors="coerce").fillna(0).astype("Int64")
-
-    out.drop(columns=["_KEY_TUSS"], inplace=True, errors="ignore")
-    return out
+    # códigos formato "0" (homologado)
+    for code_col in ["CÓD. TUSS", "CÓD. PRODUTO"]:
+        if code_col in cols:
+            idx = cols.index(code_col) + 1
+            for r in range(2, ws.max_row + 1):
+                raw = ws.cell(row=r, column=idx).value
+                try_write_numeric(ws, r, idx, raw)
+                ws.cell(row=r, column=idx).number_format = "0"
 
 
-def ensure_col_ab_cirurgiao(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    if "CIRURGIÃO" not in out.columns:
-        out["CIRURGIÃO"] = ""
-    if "CBHPM" in out.columns:
-        cols = list(out.columns)
-        cols = [c for c in cols if c != "CIRURGIÃO"]
-        idx = cols.index("CBHPM") + 1
-        cols.insert(idx, "CIRURGIÃO")
-        out = out[cols]
-    return out
+def build_excel_bytes(final_df: pd.DataFrame, tabela_df: pd.DataFrame) -> bytes:
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    # Aba TABELA (homologado)
+    ws_tab = wb.create_sheet("TABELA")
+    if tabela_df is not None and not tabela_df.empty:
+        ws_tab.append(list(tabela_df.columns))
+        for _, row in tabela_df.iterrows():
+            ws_tab.append([row.get(c) for c in tabela_df.columns])
+    else:
+        ws_tab.append(["(Sem TABELA.xlsx carregado)"])
+
+    chunks = chunk_dataframe_for_excel(final_df)
+
+    for chunk in chunks:
+        name = chunk_sheet_name(chunk)
+        sheet_name = name[:31]
+
+        base_name = sheet_name
+        i = 2
+        while sheet_name in wb.sheetnames:
+            sheet_name = (base_name[:28] + f"_{i}")[:31]
+            i += 1
+
+        ws = wb.create_sheet(sheet_name)
+
+        # header
+        ws.append(list(chunk.columns))
+        header_font = Font(bold=True)
+        for c in range(1, ws.max_column + 1):
+            cell = ws.cell(row=1, column=c)
+            cell.font = header_font
+            cell.alignment = Alignment(
+                horizontal="center", vertical="center", wrap_text=True)
+
+        cols = list(chunk.columns)
+
+        def col_letter(col_name: str) -> str:
+            idx = cols.index(col_name) + 1
+            return get_column_letter(idx)
+
+        # dados + fórmulas
+        for r_idx, (_, row) in enumerate(chunk.iterrows(), start=2):
+            for c_idx, col_name in enumerate(cols, start=1):
+                ws.cell(row=r_idx, column=c_idx).value = row.get(col_name, "")
+
+            if all(x in cols for x in ["CBHPM", "VIA DE ACESSO", "QUANTIDADE", "QTD_AUX_TABELA"]):
+                cb = f"{col_letter('CBHPM')}{r_idx}"
+                via = f"{col_letter('VIA DE ACESSO')}{r_idx}"
+                qt = f"{col_letter('QUANTIDADE')}{r_idx}"
+                qa = f"{col_letter('QTD_AUX_TABELA')}{r_idx}"
+
+                cir_col = col_letter(
+                    "CIRURGIÃO") if "CIRURGIÃO" in cols else None
+                a1_col = col_letter(
+                    "1º AUXILIAR") if "1º AUXILIAR" in cols else None
+                a2_col = col_letter(
+                    "2º AUXILIAR") if "2º AUXILIAR" in cols else None
+                a3_col = col_letter(
+                    "3º AUXILIAR") if "3º AUXILIAR" in cols else None
+                def_col = col_letter(
+                    "DEFLATOR") if "DEFLATOR" in cols else None
+                reg_col = col_letter(
+                    "VALOR DE REP. REGRA") if "VALOR DE REP. REGRA" in cols else None
+
+                if cir_col:
+                    ws[f"{cir_col}{r_idx}"].value = f"={cb}*{via}*{qt}"
+                if a1_col and cir_col:
+                    ws[f"{a1_col}{r_idx}"].value = f"=IF({qa}>=1,{cir_col}{r_idx}*0.3,0)"
+                if a2_col and cir_col:
+                    ws[f"{a2_col}{r_idx}"].value = f"=IF({qa}>=2,{cir_col}{r_idx}*0.2,0)"
+                if a3_col and a1_col:
+                    ws[f"{a3_col}{r_idx}"].value = f"=IF({qa}>=3,{a1_col}{r_idx}*0.1,0)"
+                if def_col and a1_col and a2_col and a3_col:
+                    ws[f"{def_col}{r_idx}"].value = f"=({a1_col}{r_idx}+{a2_col}{r_idx}+{a3_col}{r_idx})*0.2"
+                if reg_col and cir_col and a1_col and a2_col and a3_col and def_col:
+                    ws[f"{reg_col}{r_idx}"].value = f"=({cir_col}{r_idx}+{a1_col}{r_idx}+{a2_col}{r_idx}+{a3_col}{r_idx})-{def_col}{r_idx}"
+
+        # garante números (inclui QUANTIDADE como valor)
+        normalize_numeric_columns_for_excel(ws, cols)
+
+        # Formatações homologadas:
+        # CBHPM: #.##0,00
+        if "CBHPM" in cols:
+            cb_idx = cols.index("CBHPM") + 1
+            set_col_format(ws, cb_idx, "#.##0,00", start_row=2)
+
+        # largura leve
+        for c in range(1, ws.max_column + 1):
+            ws.column_dimensions[get_column_letter(c)].width = 18
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
 
-def ensure_cols_ac_to_ak(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    novas = [
-        "1º AUXILIAR",
-        "2º AUXILIAR",
-        "3º AUXILIAR",
-        "DEFLATOR",
-        "VALOR DE REP. REGRA",
-        "VALOR REP. SISHOP",
-        "COMPLEMENTE",
-        "DEDUÇÃO",
-        "PROFISSIONAL",
-    ]
-    for c in novas:
-        if c not in out.columns:
-            out[c] = ""
+# =========================
+# 10) UPLOAD: salvar sem sobrescrever
+# =========================
 
-    if "CIRURGIÃO" in out.columns:
-        cols = list(out.columns)
-        cols_sem_novas = [c for c in cols if c not in novas]
+def safe_save_uploaded_file(uploaded_file, target_dir: str, forced_name: str | None = None) -> str:
+    """
+    Salva evitando sobrescrever. Retorna o caminho final.
+    """
+    os.makedirs(target_dir, exist_ok=True)
+    original_name = forced_name if forced_name else uploaded_file.name
+    base, ext = os.path.splitext(original_name)
+    candidate = os.path.join(target_dir, original_name)
+
+    if not os.path.exists(candidate):
+        with open(candidate, "wb") as out:
+            out.write(uploaded_file.getbuffer())
+        return candidate
+
+    i = 2
+    while True:
+        new_name = f"{base}_{i}{ext}"
+        candidate = os.path.join(target_dir, new_name)
+        if not os.path.exists(candidate):
+            with open(candidate, "wb") as out:
+                out.write(uploaded_file.getbuffer())
+            return candidate
+        i += 1
+
+
+# =========================
+# 11) LIMPAR BASE (TXT)
+# =========================
+
+def limpar_base_txt() -> int:
+    """
+    Apaga apenas arquivos .txt da pasta base. Retorna quantidade apagada.
+    """
+    removed = 0
+    for p in glob.glob(os.path.join(BASE_DIR, "*.txt")):
         try:
-            idx = cols_sem_novas.index("CIRURGIÃO") + 1
-            for offset, c in enumerate(novas):
-                cols_sem_novas.insert(idx + offset, c)
-            out = out[cols_sem_novas]
-        except ValueError:
+            os.remove(p)
+            removed += 1
+        except:
             pass
-
-    return out
-
-
-# =========================
-# PIPELINE (homologado)
-# =========================
-def normalizar_cbhpm_para_numerico(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    CBHPM numérico Float64 e arredondado em 2 casas (para manter 2 decimais).
-    """
-    out = df.copy()
-    if "CBHPM" in out.columns:
-        out["CBHPM"] = _to_float_series_any(out["CBHPM"].astype(str)).round(2)
-    return out
-
-
-def preencher_cirurgiao_por_formula(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    CIRURGIÃO = CBHPM * VIA DE ACESSO * QUANTIDADE
-    """
-    out = df.copy()
-    if "CIRURGIÃO" not in out.columns:
-        out["CIRURGIÃO"] = ""
-    if "CBHPM" not in out.columns or "VIA DE ACESSO" not in out.columns or "QUANTIDADE" not in out.columns:
-        return out
-
-    cbhpm_f = pd.to_numeric(out["CBHPM"], errors="coerce").fillna(0).astype("Float64")
-    via_f = _to_float_series_any(out["VIA DE ACESSO"].astype(str)).fillna(0)
-    qtd_f = pd.to_numeric(out["QUANTIDADE"], errors="coerce").fillna(0).astype("Float64")
-
-    out["CIRURGIÃO"] = (cbhpm_f * via_f * qtd_f).astype("Float64")
-    return out
-
-
-def preencher_auxiliares_por_regra(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    for c in ("1º AUXILIAR", "2º AUXILIAR", "3º AUXILIAR"):
-        if c not in out.columns:
-            out[c] = ""
-    if "QTD_AUX_TABELA" not in out.columns or "CIRURGIÃO" not in out.columns:
-        return out
-
-    qtd = pd.to_numeric(out["QTD_AUX_TABELA"], errors="coerce").fillna(0).astype(int)
-    cir = _to_float_series_any(out["CIRURGIÃO"].astype(str)).fillna(0)
-
-    aux1 = (qtd >= 1).astype(int) * (cir * 0.3)
-    aux2 = (qtd >= 2).astype(int) * (cir * 0.2)
-    aux3 = (qtd >= 3).astype(int) * (aux1 * 0.1)
-
-    out["1º AUXILIAR"] = aux1.astype("Float64")
-    out["2º AUXILIAR"] = aux2.astype("Float64")
-    out["3º AUXILIAR"] = aux3.astype("Float64")
-    return out
-
-
-def preencher_deflator_e_rep_regra(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    if "DEFLATOR" not in out.columns:
-        out["DEFLATOR"] = ""
-    if "VALOR DE REP. REGRA" not in out.columns:
-        out["VALOR DE REP. REGRA"] = ""
-
-    needed = ["CIRURGIÃO", "1º AUXILIAR", "2º AUXILIAR", "3º AUXILIAR"]
-    for c in needed:
-        if c not in out.columns:
-            return out
-
-    cir = _to_float_series_any(out["CIRURGIÃO"].astype(str)).fillna(0)
-    a1 = _to_float_series_any(out["1º AUXILIAR"].astype(str)).fillna(0)
-    a2 = _to_float_series_any(out["2º AUXILIAR"].astype(str)).fillna(0)
-    a3 = _to_float_series_any(out["3º AUXILIAR"].astype(str)).fillna(0)
-
-    deflator = (a1 + a2 + a3) * 0.20
-    rep_regra = (cir + a1 + a2 + a3) - deflator
-
-    out["DEFLATOR"] = deflator.astype("Float64")
-    out["VALOR DE REP. REGRA"] = rep_regra.astype("Float64")
-    return out
+    return removed
 
 
 # =========================
-# EXPORTAÇÃO EXCEL COM FÓRMULAS + FORMATAÇÕES
+# 12) STREAMLIT UI
 # =========================
-def build_excel_with_formulas(
-    chunks: list[tuple[str, pd.DataFrame]],
-    tabela_sheet_df: pd.DataFrame | None,
-) -> bytes:
-    """
-    Excel exportado:
-      - abas de dados (chunks)
-      - aba TABELA (para VLOOKUP)
-      - fórmulas:
-        CIRURGIÃO, 1º AUXILIAR, 2º AUXILIAR, 3º AUXILIAR, DEFLATOR, VALOR DE REP. REGRA
-      - FORMATAÇÕES:
-        * CBHPM: "#.##0,00" (milhar "." / decimal "," / 2 casas)
-        * CÓD. TUSS e CÓD. PRODUTO: numéricos (cell.value = número) e formato "0"
-    """
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        for sheet_name, df_chunk in chunks:
-            safe_name = sheet_name[:31]
-            df_chunk.to_excel(writer, index=False, sheet_name=safe_name)
 
-        if tabela_sheet_df is not None and not tabela_sheet_df.empty:
-            tabela_sheet_df.to_excel(writer, index=False, sheet_name="TABELA")
+st.set_page_config(page_title="HM — Processador Hospitalar",
+                   page_icon="🏥", layout="wide")
+st.title("🏥 HM — Processador Hospitalar TXT → Excel")
 
-        wb = writer.book
+with st.expander("📌 Pasta base detectada", expanded=True):
+    st.write(f"**Pasta base em uso:** `{BASE_DIR}`")
+    st.caption(
+        "O sistema detecta automaticamente `C:\\base_de_dados` (Windows) ou usa `./base_de_dados` (cloud).")
 
-        for sheet_name, _df_chunk in chunks:
-            ws = wb[sheet_name[:31]]
-            max_row = ws.max_row
-            if max_row < 2:
-                continue
+col_up1, col_up2 = st.columns([2, 1], gap="large")
 
-            header_to_col = {}
-            for idx, cell in enumerate(ws[1], start=1):
-                header_to_col[str(cell.value).strip()] = idx
+with col_up1:
+    st.subheader("📤 Upload de arquivos")
+    txt_files = st.file_uploader(
+        "Envie os arquivos .txt (múltiplos)",
+        type=["txt"],
+        accept_multiple_files=True
+    )
+    tabela_file = st.file_uploader(
+        "Envie o arquivo TABELA.xlsx (aba TABELA)",
+        type=["xlsx"],
+        accept_multiple_files=False
+    )
 
-            required = [
-                "CBHPM",
-                "VIA DE ACESSO",
-                "QUANTIDADE",
-                "CÓD. TUSS",
-                "CÓD. PRODUTO",
-                "CIRURGIÃO",
-                "1º AUXILIAR",
-                "2º AUXILIAR",
-                "3º AUXILIAR",
-                "DEFLATOR",
-                "VALOR DE REP. REGRA",
-            ]
-            if any(c not in header_to_col for c in required):
-                continue
+    save_clicked = st.button(
+        "💾 Salvar uploads na pasta base", use_container_width=True)
 
-            col_cbhpm = get_column_letter(header_to_col["CBHPM"])
-            col_via = get_column_letter(header_to_col["VIA DE ACESSO"])
-            col_qtd = get_column_letter(header_to_col["QUANTIDADE"])
-            col_tuss = get_column_letter(header_to_col["CÓD. TUSS"])
-            col_prod = get_column_letter(header_to_col["CÓD. PRODUTO"])
+    if save_clicked:
+        saved_any = False
 
-            col_cir = get_column_letter(header_to_col["CIRURGIÃO"])
-            col_a1 = get_column_letter(header_to_col["1º AUXILIAR"])
-            col_a2 = get_column_letter(header_to_col["2º AUXILIAR"])
-            col_a3 = get_column_letter(header_to_col["3º AUXILIAR"])
-            col_def = get_column_letter(header_to_col["DEFLATOR"])
-            col_rep = get_column_letter(header_to_col["VALOR DE REP. REGRA"])
+        if txt_files:
+            for f in txt_files:
+                safe_save_uploaded_file(f, BASE_DIR)  # evita sobrescrever
+                saved_any = True
 
-            # FORMATAÇÕES por coluna (e conversão para número em TUSS/PROD)
-            for r in range(2, max_row + 1):
-                # CBHPM: 2 casas e BR
-                ws[f"{col_cbhpm}{r}"].number_format = "#.##0,00"
+        if tabela_file is not None:
+            safe_save_uploaded_file(
+                tabela_file, BASE_DIR, forced_name="TABELA.xlsx")
+            saved_any = True
 
-                # CÓD. TUSS e CÓD. PRODUTO: converter para número quando possível
-                # (mantém vazio se não converter)
-                for col in (col_tuss, col_prod):
-                    cell = ws[f"{col}{r}"]
-                    v = cell.value
-                    if v is None:
-                        continue
-                    s = str(v).strip()
-                    if s == "" or s.lower() in ("nan", "none"):
-                        cell.value = None
-                        continue
-                    # remove separadores comuns e .0
-                    s = s.replace(".", "").replace(",", "").strip()
-                    if s.endswith(".0"):
-                        s = s[:-2]
-                    # tenta int
-                    try:
-                        num = int(float(s))
-                        cell.value = num
-                        cell.number_format = "0"
-                    except Exception:
-                        # se não der, mantém como está
-                        pass
-
-            # fórmulas por linha
-            for r in range(2, max_row + 1):
-                cbhpm_cell = f"{col_cbhpm}{r}"
-                via_cell = f"{col_via}{r}"
-                qtd_cell = f"{col_qtd}{r}"
-                tuss_cell = f"{col_tuss}{r}"
-
-                cir_cell = f"{col_cir}{r}"
-                a1_cell = f"{col_a1}{r}"
-                a2_cell = f"{col_a2}{r}"
-                a3_cell = f"{col_a3}{r}"
-                def_cell = f"{col_def}{r}"
-                rep_cell = f"{col_rep}{r}"
-
-                ws[cir_cell].value = f"={cbhpm_cell}*{via_cell}*{qtd_cell}"
-
-                ws[a1_cell].value = f"=IF(1<=VLOOKUP({tuss_cell},TABELA!$E:$K,7,FALSE),{cir_cell}*0.3,0)"
-                ws[a2_cell].value = f"=IF(2<=VLOOKUP({tuss_cell},TABELA!$E:$K,7,FALSE),{cir_cell}*0.2,0)"
-                ws[a3_cell].value = f"=IF(3<=VLOOKUP({tuss_cell},TABELA!$E:$K,7,FALSE),{a1_cell}*0.1,0)"
-
-                ws[def_cell].value = f"=({a1_cell}+{a2_cell}+{a3_cell})*0.2"
-                ws[rep_cell].value = f"=({cir_cell}+{a1_cell}+{a2_cell}+{a3_cell})-{def_cell}"
-
-    buffer.seek(0)
-    return buffer.getvalue()
-
-
-# =========================
-# STREAMLIT UI
-# =========================
-st.set_page_config(page_title="HM — Processador TXT", layout="wide")
-st.title("🏥 HM — Processador de TXT (TAB)")
-st.caption(f"Pasta monitorada: {PASTA_BASE}")
-
-arquivos = list_txt_files(PASTA_BASE)
-if not arquivos:
-    st.warning("Nenhum arquivo .txt encontrado na pasta C:\\base_de_dados")
-    st.stop()
-
-st.markdown("### 1) Normalização + Acumulado + Enriquecimento (TABELA)")
-
-c1, c2, c3, c4 = st.columns([2, 1, 1, 2])
-
-with c1:
-    renomear_automatico = st.checkbox("Renomear automaticamente os TXT por ENTRADA", value=True)
-with c2:
-    mostrar_detalhes_renomeio = st.checkbox("Mostrar log", value=True)
-with c3:
-    usar_tabela = st.checkbox("Aplicar TABELA (PORTE/CBHPM)", value=True)
-
-mapping = pd.DataFrame()
-status_tabela = "TABELA não aplicada."
-excel_tabela_path = None
-tabela_sheet_df = None
-
-if usar_tabela:
-    excel_tabela_path = find_tabela_excel(PASTA_BASE)
-    if excel_tabela_path is None:
-        status_tabela = "Arquivo Excel 'TABELA' não encontrado em C:\\base_de_dados (TABELA.xlsx/.xlsm/.xls)."
-    else:
-        mapping, status_tabela = load_tabela_mapping(excel_tabela_path)
-        try:
-            tabela_sheet_df = load_tabela_sheet_df(excel_tabela_path)
-        except Exception:
-            tabela_sheet_df = None
-
-st.caption(f"📌 Status TABELA: {status_tabela}")
-
-dfs = []
-log_execucao = []
-
-for fpath in arquivos:
-    try:
-        df_raw = read_txt_tab(fpath)
-    except Exception as e:
-        log_execucao.append((fpath.name, f"Falha ao ler TXT: {e}"))
-        continue
-
-    if df_raw.shape[1] != len(CABECALHOS):
-        log_execucao.append((fpath.name, f"⚠️ Colunas: {df_raw.shape[1]} (esperado {len(CABECALHOS)})"))
-
-    if renomear_automatico and fpath.exists():
-        novo_path, status = maybe_rename_txt_by_entrada(fpath, df_raw)
-        log_execucao.append((fpath.name, status))
-        fpath = novo_path
-    else:
-        log_execucao.append((fpath.name, "Leitura OK (sem renomeio)"))
-
-    df_proc = aplicar_tipos(df_raw)
-    df_proc["ARQUIVO_ORIGEM"] = fpath.name
-    dfs.append(df_proc)
-
-if mostrar_detalhes_renomeio:
-    with st.expander("🧾 Log de execução"):
-        for nome_arq, status in log_execucao:
-            st.write(f"- **{nome_arq}** → {status}")
-
-if not dfs:
-    st.error("Não foi possível processar nenhum arquivo TXT (verifique o log acima).")
-    st.stop()
-
-df_final = pd.concat(dfs, ignore_index=True)
-
-# pipeline homologado (mantido)
-df_final = enrich_with_tabela(df_final, mapping)
-df_final = normalizar_cbhpm_para_numerico(df_final)  # CBHPM numérico com 2 casas
-df_final = ensure_col_ab_cirurgiao(df_final)
-df_final = ensure_cols_ac_to_ak(df_final)
-df_final = preencher_cirurgiao_por_formula(df_final)
-df_final = preencher_auxiliares_por_regra(df_final)
-df_final = preencher_deflator_e_rep_regra(df_final)
-
-min_global, max_global = compute_minmax_for_sheet(df_final)
-nome_aba_futura = sheet_name_from_minmax(min_global, max_global)
-chunks = chunk_df_for_excel_by_max_rows(df_final, EXCEL_MAX_LINHAS)
-
-# Botões: Exportar + Recarregar
-with c4:
-    b1, b2 = st.columns([1, 1])
-
-    with b1:
-        export_disabled = usar_tabela and (excel_tabela_path is None or tabela_sheet_df is None or tabela_sheet_df.empty)
-        if export_disabled:
-            st.button("📤 Exportar Excel", disabled=True)
-        else:
-            excel_bytes = build_excel_with_formulas(chunks, tabela_sheet_df if usar_tabela else None)
-            nome_base = f"HM_{nome_aba_futura}"
-            st.download_button(
-                "📤 Exportar Excel",
-                data=excel_bytes,
-                file_name=f"{nome_base}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-
-    with b2:
-        if st.button("🔄 Recarregar", use_container_width=True):
+        if saved_any:
+            st.success("Arquivos salvos na pasta base. Recarregando…")
             st.rerun()
+        else:
+            st.warning("Nenhum arquivo foi enviado para salvar.")
 
-if usar_tabela and (excel_tabela_path is None or tabela_sheet_df is None or tabela_sheet_df.empty):
-    st.warning("Para exportar com fórmulas (PROCV/VLOOKUP), é necessário o arquivo TABELA.xlsx na pasta e a aba 'TABELA' válida.")
+with col_up2:
+    st.subheader("📁 Conteúdo atual da base")
+    txt_list = list_txt_files()
+    st.write(f"**TXT na pasta:** {len(txt_list)}")
+    if txt_list:
+        st.caption("Arquivos encontrados:")
+        st.write("\n".join([f"- {os.path.basename(p)}" for p in txt_list]))
+    else:
+        st.info("Nenhum TXT encontrado na pasta base.")
 
-st.markdown("### 2) Resultado acumulado (todos os TXT da pasta)")
+    st.write("---")
+    has_tabela = os.path.exists(TABELA_XLSX_PATH)
+    st.write(
+        f"**TABELA.xlsx:** {'✅ encontrado' if has_tabela else '❌ não encontrado'}")
 
-if pd.isna(min_global) or pd.isna(max_global):
-    st.warning("Não foi possível calcular o intervalo global de ENTRADA (datas inválidas/ausentes).")
+st.write("---")
+
+# Botões principais (Recarregar / Exportar único)
+btn_col1, btn_col2 = st.columns([1, 1], gap="large")
+
+recarregar = btn_col1.button(
+    "🔄 Recarregar (processar TXT da base)", use_container_width=True)
+
+# Processa sempre que clicar ou se ainda não tiver dados
+if recarregar or "final_df" not in st.session_state:
+    try:
+        main_df = process_all_txts()
+        tabela_df = load_tabela_df(TABELA_XLSX_PATH) if os.path.exists(
+            TABELA_XLSX_PATH) else pd.DataFrame()
+        tabela_map = build_tabela_map(
+            tabela_df) if not tabela_df.empty else pd.DataFrame()
+
+        final_df = integrate_tabela(main_df, tabela_map)
+        final_df = ensure_additional_columns(final_df)
+
+        preview_df = compute_preview_values(final_df)
+
+        st.session_state["main_df"] = main_df
+        st.session_state["tabela_df"] = tabela_df
+        st.session_state["final_df"] = final_df
+        st.session_state["preview_df"] = preview_df
+
+        # invalida cache de excel para forçar novo quando dados mudarem
+        st.session_state.pop("excel_bytes", None)
+        st.session_state.pop("excel_filename", None)
+
+    except Exception as e:
+        st.error(f"Erro no processamento: {e}")
+
+final_df = st.session_state.get("final_df", pd.DataFrame())
+preview_df = st.session_state.get("preview_df", pd.DataFrame())
+tabela_df = st.session_state.get("tabela_df", pd.DataFrame())
+
+st.subheader("✅ Preview (com regras em Python)")
+if preview_df is None or preview_df.empty:
+    st.info("Sem dados para exibir. Envie TXT e clique em Recarregar.")
 else:
-    st.caption(
-        f"Intervalo global (ENTRADA): **{min_global.strftime('%d/%m/%Y')}** a **{max_global.strftime('%d/%m/%Y')}** "
-        f"• Nome de aba sugerido (exportação): **{nome_aba_futura}**"
-    )
+    st.dataframe(preview_df.head(200), use_container_width=True)
 
-if usar_tabela and "CÓD. TUSS" in df_final.columns:
-    total_linhas = len(df_final)
-    qtd_porte = (df_final["PORTE"].astype(str).str.strip() != "").sum() if "PORTE" in df_final.columns else 0
-    qtd_cbhpm = (pd.to_numeric(df_final["CBHPM"], errors="coerce").fillna(0) != 0).sum() if "CBHPM" in df_final.columns else 0
-    st.caption(
-        f"Matches via TABELA — PORTE preenchido em **{qtd_porte:,}** linhas, "
-        f"CBHPM preenchido em **{qtd_cbhpm:,}** linhas (de {total_linhas:,}).".replace(",", ".")
-    )
+# ===== Exportação em UM ÚNICO BOTÃO (download direto) =====
+# gera bytes uma vez por sessão (ou quando recarregar)
+if final_df is not None and not final_df.empty:
+    if "excel_bytes" not in st.session_state:
+        try:
+            st.session_state["excel_bytes"] = build_excel_bytes(
+                final_df,
+                tabela_df if isinstance(
+                    tabela_df, pd.DataFrame) else pd.DataFrame()
+            )
+            st.session_state["excel_filename"] = f"HM_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        except Exception as e:
+            st.session_state["excel_bytes"] = None
+            st.session_state["excel_filename"] = None
+            st.error(f"Erro ao preparar Excel: {e}")
 
-df_view = formatar_exibicao(df_final)
-st.dataframe(df_view, use_container_width=True, height=560)
+    excel_bytes = st.session_state.get("excel_bytes")
+    excel_filename = st.session_state.get("excel_filename")
 
-st.markdown("### 3) Prévia da divisão por abas (para exportação futura)")
-st.write(f"Total de linhas acumuladas: **{len(df_final):,}**".replace(",", "."))
-st.write(f"Quantidade de abas necessárias (se exportasse agora): **{len(chunks)}**")
-
-with st.expander("📌 Detalhes das abas planejadas"):
-    for i, (sname, chunk) in enumerate(chunks, start=1):
-        mn, mx = compute_minmax_for_sheet(chunk)
-        mn_txt = mn.strftime("%d/%m/%Y") if pd.notna(mn) else "—"
-        mx_txt = mx.strftime("%d/%m/%Y") if pd.notna(mx) else "—"
-        st.write(
-            f"**Aba {i}: {sname}** • Linhas: {len(chunk):,}".replace(",", ".")
-            + f" • ENTRADA: {mn_txt} a {mx_txt}"
+    if excel_bytes:
+        exported = btn_col2.download_button(
+            label="📥 Exportar Excel (com fórmulas)",
+            data=excel_bytes,
+            file_name=excel_filename,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
         )
+        if exported:
+            st.success(
+                "Excel exportado com sucesso (inclui aba TABELA e fórmulas reais).")
+    else:
+        btn_col2.button("📥 Exportar Excel (com fórmulas)",
+                        use_container_width=True, disabled=True)
+else:
+    btn_col2.button("📥 Exportar Excel (com fórmulas)",
+                    use_container_width=True, disabled=True)
 
-with st.expander("🔎 Diagnóstico rápido"):
-    st.write("Colunas:", list(df_final.columns))
-    st.write("Amostra (processado):")
-    st.dataframe(df_final.head(10), use_container_width=True)
-    if usar_tabela and excel_tabela_path is not None:
-        st.write(f"Excel TABELA usado: {excel_tabela_path.name}")
+st.write("---")
+
+# ===== Botão Limpar base =====
+st.subheader("🧹 Manutenção da base")
+
+col_l1, col_l2 = st.columns([2, 1], gap="large")
+with col_l1:
+    st.caption(
+        "Esta ação apaga **somente** os arquivos **.txt** da pasta base. O `TABELA.xlsx` é mantido.")
+    confirm_clear = st.checkbox(
+        "Confirmo que desejo apagar TODOS os .txt da pasta base.", value=False)
+
+with col_l2:
+    if st.button("🧹 Limpar base (apagar TXT)", use_container_width=True, disabled=not confirm_clear):
+        removed = limpar_base_txt()
+        # limpa sessão
+        for k in ["main_df", "tabela_df", "final_df", "preview_df", "excel_bytes", "excel_filename"]:
+            st.session_state.pop(k, None)
+        st.success(f"Base limpa: {removed} arquivo(s) .txt removido(s).")
+        st.rerun()
