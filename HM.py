@@ -170,13 +170,12 @@ def build_excel(final_df, tabela_df):
                 cell.number_format = "0%"
 
             elif col in money_two_dec_cols:
-                # mantém fórmula, só aplica formatação
                 cell.number_format = "#,##0.00"
 
             else:
                 cell.value = value
 
-        # ========= FÓRMULAS (INALTERADAS) =========
+        # ========= FÓRMULAS =========
 
         cod_tuss = f"{col_letter('CÓD. TUSS')}{r_idx}"
         hospital = f"{col_letter('UNIDADE')}{r_idx}"
@@ -194,16 +193,18 @@ def build_excel(final_df, tabela_df):
             f'=IFERROR(VLOOKUP(VALUE({cod_tuss}),TABELA!E:K,7,FALSE),0)'
         )
 
-        cb = f"{col_letter('CBHPM')}{r_idx}"
-        via = f"{col_letter('VIA DE ACESSO')}{r_idx}"
-        qt = f"{col_letter('QUANTIDADE')}{r_idx}"
-        qa = f"{col_letter('QTD_AUX_TABELA')}{r_idx}"
+        # NOVOS CÁLCULOS CONFORME PRINTS
 
-        ws[f"{col_letter('CIRURGIÃO')}{r_idx}"] = f"={cb}*{via}*{qt}"
-        ws[f"{col_letter('1º AUXILIAR')}{r_idx}"] = f"=IF({qa}>=1,{col_letter('CIRURGIÃO')}{r_idx}*0.3,0)"
-        ws[f"{col_letter('2º AUXILIAR')}{r_idx}"] = f"=IF({qa}>=2,{col_letter('CIRURGIÃO')}{r_idx}*0.2,0)"
-        ws[f"{col_letter('3º AUXILIAR')}{r_idx}"] = f"=IF({qa}>=3,{col_letter('1º AUXILIAR')}{r_idx}*0.1,0)"
+        ws[f"{col_letter('CIRURGIÃO')}{r_idx}"] = f'=IF(U{r_idx}="CIRURGIAO",AA{r_idx}*V{r_idx}*H{r_idx},0)'
+
+        ws[f"{col_letter('1º AUXILIAR')}{r_idx}"] = f'=IF(U{r_idx}="1º AUXILIAR",IF(AB{r_idx}>=1,(AA{r_idx}*V{r_idx}*H{r_idx})*0.3,0),0)'
+
+        ws[f"{col_letter('2º AUXILIAR')}{r_idx}"] = f'=IF(U{r_idx}="2º AUXILIAR",IF(AB{r_idx}>=2,(AA{r_idx}*V{r_idx}*H{r_idx})*0.2,0),0)'
+
+        ws[f"{col_letter('3º AUXILIAR')}{r_idx}"] = f'=IF(U{r_idx}="3º AUXILIAR",IF(AB{r_idx}>=3,(AA{r_idx}*V{r_idx}*H{r_idx})*0.1,0),0)'
+
         ws[f"{col_letter('DEFLATOR')}{r_idx}"] = f"=({col_letter('1º AUXILIAR')}{r_idx}+{col_letter('2º AUXILIAR')}{r_idx}+{col_letter('3º AUXILIAR')}{r_idx})*0.2"
+
         ws[f"{col_letter('VALOR DE REP. REGRA')}{r_idx}"] = f"=({col_letter('CIRURGIÃO')}{r_idx}+{col_letter('1º AUXILIAR')}{r_idx}+{col_letter('2º AUXILIAR')}{r_idx}+{col_letter('3º AUXILIAR')}{r_idx})-{col_letter('DEFLATOR')}{r_idx}"
 
     buf = io.BytesIO()
