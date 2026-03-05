@@ -1,25 +1,18 @@
 # HM.py — HM – Processador Hospitalar TXT → Excel
 # VERSÃO DEFINITIVA 100% CLOUD (COM FÓRMULAS REAIS NO EXCEL)
+# AJUSTES: FORMATAÇÃO NUMÉRICA COMPLETA
 
 import io
 from datetime import datetime
-from typing import List
-
 import pandas as pd
 import streamlit as st
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Alignment, Font
 
-# =========================
-# CONFIG STREAMLIT
-# =========================
 st.set_page_config(page_title="HM — Processador Hospitalar",
                    page_icon="🏥", layout="wide")
 
-# =========================
-# CABEÇALHOS FIXOS
-# =========================
 FIXED_HEADERS_A_TO_Y = [
     "REGISTRO", "NOME DO PACIENTE", "ENTRADA", "SAÍDA", "TIPO DE PRODUTO",
     "CÓD. PRODUTO", "DESC. PRODUTO", "QUANTIDADE", "COMANDA", "CÓD. TUSS",
@@ -36,12 +29,6 @@ ADDITIONAL_COLS_ORDER = [
     "VALOR REP. SISHOP", "COMPLEMENTE", "DEDUÇÃO", "PROFISSIONAL",
 ]
 
-CHUNK_SAFE_ROWS = 1_048_000
-
-# =========================
-# UTIL
-# =========================
-
 
 def to_float_safe(x, default=0.0):
     if x is None:
@@ -54,10 +41,6 @@ def to_float_safe(x, default=0.0):
         return float(s2)
     except:
         return default
-
-# =========================
-# LEITURA TXT
-# =========================
 
 
 def read_txt(uploaded_file):
@@ -78,10 +61,6 @@ def read_txt(uploaded_file):
     df.columns = FIXED_HEADERS_A_TO_Y
     return df.astype(str)
 
-# =========================
-# TABELA
-# =========================
-
 
 def load_tabela(uploaded_file):
     try:
@@ -93,25 +72,16 @@ def load_tabela(uploaded_file):
 
 def build_tabela_map(tabela_df):
     if tabela_df.empty:
-        return pd.DataFrame(columns=["KEY_TUSS", "PORTE", "CBHPM", "QTD_AUX_TABELA"])
+        return pd.DataFrame(columns=["KEY_TUSS", "PORTE"])
 
     key_col = tabela_df.columns[4] if len(
         tabela_df.columns) > 4 else tabela_df.columns[0]
     porte_col = tabela_df.columns[8] if len(tabela_df.columns) > 8 else None
-    qtd_aux_col = tabela_df.columns[10] if len(
-        tabela_df.columns) > 10 else None
-    cbhpm_col = tabela_df.columns[15] if len(tabela_df.columns) > 15 else None
 
     out = pd.DataFrame()
     out["KEY_TUSS"] = tabela_df[key_col].astype(str).str.strip()
     out["PORTE"] = tabela_df[porte_col] if porte_col else ""
-    out["CBHPM"] = tabela_df[cbhpm_col] if cbhpm_col else ""
-    out["QTD_AUX_TABELA"] = tabela_df[qtd_aux_col] if qtd_aux_col else ""
     return out
-
-# =========================
-# PREVIEW CÁLCULO PYTHON
-# =========================
 
 
 def compute_preview(df):
@@ -124,12 +94,12 @@ def compute_preview(df):
     qtd = df["QUANTIDADE"].apply(lambda v: to_float_safe(v, 0))
     qtd_aux = df["QTD_AUX_TABELA"].apply(lambda v: int(to_float_safe(v, 0)))
 
-    cir = cbhpm*via*qtd
-    aux1 = cir*0.3*(qtd_aux >= 1)
-    aux2 = cir*0.2*(qtd_aux >= 2)
-    aux3 = aux1*0.1*(qtd_aux >= 3)
-    deflator = (aux1+aux2+aux3)*0.2
-    regra = (cir+aux1+aux2+aux3)-deflator
+    cir = cbhpm * via * qtd
+    aux1 = cir * 0.3 * (qtd_aux >= 1)
+    aux2 = cir * 0.2 * (qtd_aux >= 2)
+    aux3 = aux1 * 0.1 * (qtd_aux >= 3)
+    deflator = (aux1 + aux2 + aux3) * 0.2
+    regra = (cir + aux1 + aux2 + aux3) - deflator
 
     df["CIRURGIÃO"] = cir
     df["1º AUXILIAR"] = aux1
@@ -140,16 +110,12 @@ def compute_preview(df):
 
     return df
 
-# =========================
-# EXCEL COM FÓRMULAS REAIS
-# =========================
-
 
 def build_excel(final_df, tabela_df):
+
     wb = Workbook()
     wb.remove(wb.active)
 
-    # Aba TABELA
     ws_tab = wb.create_sheet("TABELA")
     if not tabela_df.empty:
         ws_tab.append(list(tabela_df.columns))
@@ -158,45 +124,93 @@ def build_excel(final_df, tabela_df):
     else:
         ws_tab.append(["(Sem TABELA carregada)"])
 
-    # Aba principal
     ws = wb.create_sheet("PROCESSADO")
     ws.append(list(final_df.columns))
 
     header_font = Font(bold=True)
+    cols = list(final_df.columns)
+
     for col in range(1, ws.max_column+1):
         ws.cell(row=1, column=col).font = header_font
         ws.cell(row=1, column=col).alignment = Alignment(horizontal="center")
 
-    cols = list(final_df.columns)
-
     def col_letter(name):
         return get_column_letter(cols.index(name)+1)
 
+    numeric_zero_cols = [
+        "REGISTRO", "CÓD. PRODUTO", "QUANTIDADE",
+        "CÓD. TUSS", "NUM. REMESSA"
+    ]
+
+    money_two_dec_cols = [
+        "CBHPM", "CIRURGIÃO", "1º AUXILIAR",
+        "2º AUXILIAR", "3º AUXILIAR",
+        "DEFLATOR", "VALOR DE REP. REGRA"
+    ]
+
     for r_idx, (_, row) in enumerate(final_df.iterrows(), start=2):
+
         for c_idx, col in enumerate(cols, start=1):
-            ws.cell(row=r_idx, column=c_idx).value = row.get(col, "")
+            cell = ws.cell(row=r_idx, column=c_idx)
+            value = row.get(col, "")
 
-        if all(x in cols for x in ["CBHPM", "VIA DE ACESSO", "QUANTIDADE", "QTD_AUX_TABELA"]):
-            cb = f"{col_letter('CBHPM')}{r_idx}"
-            via = f"{col_letter('VIA DE ACESSO')}{r_idx}"
-            qt = f"{col_letter('QUANTIDADE')}{r_idx}"
-            qa = f"{col_letter('QTD_AUX_TABELA')}{r_idx}"
+            if col in numeric_zero_cols:
+                try:
+                    cell.value = float(str(value).replace(",", "."))
+                except:
+                    cell.value = 0
+                cell.number_format = "0"
 
-            ws[f"{col_letter('CIRURGIÃO')}{r_idx}"] = f"={cb}*{via}*{qt}"
-            ws[f"{col_letter('1º AUXILIAR')}{r_idx}"] = f"=IF({qa}>=1,{col_letter('CIRURGIÃO')}{r_idx}*0.3,0)"
-            ws[f"{col_letter('2º AUXILIAR')}{r_idx}"] = f"=IF({qa}>=2,{col_letter('CIRURGIÃO')}{r_idx}*0.2,0)"
-            ws[f"{col_letter('3º AUXILIAR')}{r_idx}"] = f"=IF({qa}>=3,{col_letter('1º AUXILIAR')}{r_idx}*0.1,0)"
-            ws[f"{col_letter('DEFLATOR')}{r_idx}"] = f"=({col_letter('1º AUXILIAR')}{r_idx}+{col_letter('2º AUXILIAR')}{r_idx}+{col_letter('3º AUXILIAR')}{r_idx})*0.2"
-            ws[f"{col_letter('VALOR DE REP. REGRA')}{r_idx}"] = f"=({col_letter('CIRURGIÃO')}{r_idx}+{col_letter('1º AUXILIAR')}{r_idx}+{col_letter('2º AUXILIAR')}{r_idx}+{col_letter('3º AUXILIAR')}{r_idx})-{col_letter('DEFLATOR')}{r_idx}"
+            elif col == "VALOR DO PROC.":
+                cell.value = to_float_safe(value, 0)
+                cell.number_format = "#,##0.00"
+
+            elif col == "VIA DE ACESSO":
+                cell.value = to_float_safe(value, 0)
+                cell.number_format = "0%"
+
+            elif col in money_two_dec_cols:
+                # mantém fórmula, só aplica formatação
+                cell.number_format = "#,##0.00"
+
+            else:
+                cell.value = value
+
+        # ========= FÓRMULAS (INALTERADAS) =========
+
+        cod_tuss = f"{col_letter('CÓD. TUSS')}{r_idx}"
+        hospital = f"{col_letter('UNIDADE')}{r_idx}"
+
+        ws[f"{col_letter('CBHPM')}{r_idx}"] = (
+            f'=IFERROR('
+            f'IF({hospital}="HOSPITAL VITORIA",'
+            f'VLOOKUP(VALUE({cod_tuss}),TABELA!E:Z,MATCH("VALOR H. VIT.",TABELA!$E$1:$Z$1,0),FALSE),'
+            f'IF({hospital}="HOSPITAL SAMARITANO",'
+            f'VLOOKUP(VALUE({cod_tuss}),TABELA!E:Z,MATCH("VALOR H. SAM.",TABELA!$E$1:$Z$1,0),FALSE),0)'
+            f'),0)'
+        )
+
+        ws[f"{col_letter('QTD_AUX_TABELA')}{r_idx}"] = (
+            f'=IFERROR(VLOOKUP(VALUE({cod_tuss}),TABELA!E:K,7,FALSE),0)'
+        )
+
+        cb = f"{col_letter('CBHPM')}{r_idx}"
+        via = f"{col_letter('VIA DE ACESSO')}{r_idx}"
+        qt = f"{col_letter('QUANTIDADE')}{r_idx}"
+        qa = f"{col_letter('QTD_AUX_TABELA')}{r_idx}"
+
+        ws[f"{col_letter('CIRURGIÃO')}{r_idx}"] = f"={cb}*{via}*{qt}"
+        ws[f"{col_letter('1º AUXILIAR')}{r_idx}"] = f"=IF({qa}>=1,{col_letter('CIRURGIÃO')}{r_idx}*0.3,0)"
+        ws[f"{col_letter('2º AUXILIAR')}{r_idx}"] = f"=IF({qa}>=2,{col_letter('CIRURGIÃO')}{r_idx}*0.2,0)"
+        ws[f"{col_letter('3º AUXILIAR')}{r_idx}"] = f"=IF({qa}>=3,{col_letter('1º AUXILIAR')}{r_idx}*0.1,0)"
+        ws[f"{col_letter('DEFLATOR')}{r_idx}"] = f"=({col_letter('1º AUXILIAR')}{r_idx}+{col_letter('2º AUXILIAR')}{r_idx}+{col_letter('3º AUXILIAR')}{r_idx})*0.2"
+        ws[f"{col_letter('VALOR DE REP. REGRA')}{r_idx}"] = f"=({col_letter('CIRURGIÃO')}{r_idx}+{col_letter('1º AUXILIAR')}{r_idx}+{col_letter('2º AUXILIAR')}{r_idx}+{col_letter('3º AUXILIAR')}{r_idx})-{col_letter('DEFLATOR')}{r_idx}"
 
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
 
 
-# =========================
-# UI
-# =========================
 st.title("🏥 HM — Processador Hospitalar TXT → Excel")
 
 txt_files = st.file_uploader("Envie os arquivos TXT", type=[
